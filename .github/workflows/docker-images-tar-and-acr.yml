@@ -84,7 +84,6 @@ jobs:
           echo "Pulling images for platform: ${PLATFORM} ..."
           for img in "${IMAGES[@]}"; do
             echo "Pulling $img"
-            # 使用 buildx imagetools 或 docker pull --platform
             docker pull --platform "${PLATFORM}" "$img"
           done
 
@@ -105,7 +104,7 @@ jobs:
 
           TAR_NAME="docker-images-bundle-${VERSION}-${PLATFORM_SAFE}.tar"
 
-          echo "Saving images listed in images.list into $TAR_NAME"
+          echo "Saving images in images.list into $TAR_NAME"
           docker save $(cat images.list) -o "$TAR_NAME"
           ls -lh "$TAR_NAME"
 
@@ -144,7 +143,6 @@ jobs:
           echo "Retagging and pushing images to ${ACR_REGISTRY}/${NAMESPACE}/..."
 
           while IFS= read -r image; do
-            # 防御：跳过空行 / 注释
             line="$(echo "$image" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
             [[ -z "$line" ]] && continue
             [[ "$line" =~ ^# ]] && continue
