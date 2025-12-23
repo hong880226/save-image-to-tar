@@ -16,6 +16,10 @@ on:
         description: "Create GitHub Release with tar (true/false)"
         required: true
         default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
 
   # 可选：打 tag 时自动触发（v1.0.0 这种）
   push:
@@ -104,7 +108,7 @@ jobs:
 
           TAR_NAME="docker-images-bundle-${VERSION}-${PLATFORM_SAFE}.tar"
 
-          echo "Saving images in images.list into $TAR_NAME"
+          echo "Saving images listed in images.list into $TAR_NAME"
           docker save $(cat images.list) -o "$TAR_NAME"
           ls -lh "$TAR_NAME"
 
@@ -172,11 +176,19 @@ jobs:
 
           done < images.list
 
-      - name: Optionally create GitHub Release
-        # 条件：
-        # 1) push tag 时自动创建
-        # 2) 或手动触发且 create_release == true 时创建
-        if: github.event_name == 'push' && github.ref_type == 'tag' || github.event_name == 'workflow_dispatch' && github.event.inputs.create_release == 'true'
+      # 拆成两个步骤，避免复杂的 if 表达式
+
+      - name: Create GitHub Release (tag push)
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.TAR_NAME }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create GitHub Release (manual with create_release=true)
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.create_release == 'true'
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ env.TAR_NAME }}
