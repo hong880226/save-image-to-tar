@@ -1,0 +1,187 @@
+name: Build Docker Images Tar & Push to Aliyun ACR
+
+on:
+  # 手动触发，支持选择平台和是否创建 Release
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: "Target platform (linux/amd64 or linux/arm64)"
+        required: true
+        default: "linux/amd64"
+        type: choice
+        options:
+          - linux/amd64
+          - linux/arm64
+      create_release:
+        description: "Create GitHub Release with tar (true/false)"
+        required: true
+        default: "false"
+
+  # 可选：打 tag 时自动触发（v1.0.0 这种）
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    env:
+      # 固定阿里云区域与命名空间
+      ACR_REGION: cn-hangzhou
+      ACR_NAMESPACE: temporary-repo
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU (for cross-platform pull)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Determine platform
+        id: platform
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            PLATFORM="${{ github.event.inputs.platform }}"
+          else
+            # tag push 时默认 linux/amd64
+            PLATFORM="linux/amd64"
+          fi
+          echo "PLATFORM=$PLATFORM" >> $GITHUB_ENV
+          echo "Using platform: $PLATFORM"
+
+      - name: Parse images.txt and pull images
+        id: pull
+        run: |
+          if [[ ! -f images.txt ]]; then
+            echo "images.txt not found in repo root." >&2
+            exit 1
+          fi
+
+          IMAGES=()
+          while IFS= read -r line; do
+            line="$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            [[ -z "$line" ]] && continue
+            [[ "$line" =~ ^# ]] && continue
+            IMAGES+=("$line")
+          done < images.txt
+
+          if [[ ${#IMAGES[@]} -eq 0 ]]; then
+            echo "No images found in images.txt" >&2
+            exit 1
+          fi
+
+          echo "Images to process:"
+          printf '  - %s\n' "${IMAGES[@]}"
+
+          # 保存镜像列表到文件，后面 docker save & retag 用
+          printf '%s\n' "${IMAGES[@]}" > images.list
+
+          echo
+          echo "Pulling images for platform: ${PLATFORM} ..."
+          for img in "${IMAGES[@]}"; do
+            echo "Pulling $img"
+            # 使用 buildx imagetools 或 docker pull --platform
+            docker pull --platform "${PLATFORM}" "$img"
+          done
+
+      - name: Save images to tar (single bundle)
+        id: save
+        run: |
+          # 根据触发方式决定版本号 / 文件名
+          if [[ "${{ github.event_name }}" == "push" && "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            # tag 触发：v0.6.10 -> 0.6.10
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            # 手动触发：用 run ID 区分
+            VERSION="run-${GITHUB_RUN_ID}"
+          fi
+
+          # 将平台名中的 / 替换为 -，方便做文件名
+          PLATFORM_SAFE="$(echo "${PLATFORM}" | tr '/' '-')"
+
+          TAR_NAME="docker-images-bundle-${VERSION}-${PLATFORM_SAFE}.tar"
+
+          echo "Saving images listed in images.list into $TAR_NAME"
+          docker save $(cat images.list) -o "$TAR_NAME"
+          ls -lh "$TAR_NAME"
+
+          echo "TAR_NAME=$TAR_NAME" >> $GITHUB_ENV
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "PLATFORM_SAFE=$PLATFORM_SAFE" >> $GITHUB_ENV
+
+      - name: Upload tar as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-images-bundle-${{ env.VERSION }}-${{ env.PLATFORM_SAFE }}
+          path: ${{ env.TAR_NAME }}
+          retention-days: 7
+
+      - name: Login to Aliyun ACR (cn-hangzhou)
+        env:
+          ACR_USERNAME: ${{ secrets.ALIYUN_ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ALIYUN_ACR_PASSWORD }}
+        run: |
+          if [[ -z "$ACR_USERNAME" || -z "$ACR_PASSWORD" ]]; then
+            echo "ALIYUN_ACR_USERNAME or ALIYUN_ACR_PASSWORD is not set." >&2
+            exit 1
+          fi
+
+          ACR_REGISTRY="registry.${ACR_REGION}.aliyuncs.com"
+          echo "Logging in to $ACR_REGISTRY"
+          echo "$ACR_PASSWORD" | docker login "$ACR_REGISTRY" -u "$ACR_USERNAME" --password-stdin
+
+          echo "ACR_REGISTRY=$ACR_REGISTRY" >> $GITHUB_ENV
+
+      - name: Retag and push images to Aliyun ACR (namespace: temporary-repo)
+        run: |
+          ACR_REGISTRY="${ACR_REGISTRY}"
+          NAMESPACE="${ACR_NAMESPACE}"
+
+          echo "Retagging and pushing images to ${ACR_REGISTRY}/${NAMESPACE}/..."
+
+          while IFS= read -r image; do
+            # 防御：跳过空行 / 注释
+            line="$(echo "$image" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            [[ -z "$line" ]] && continue
+            [[ "$line" =~ ^# ]] && continue
+
+            SRC_IMG="$line"
+
+            # 分离 repo 和 tag（最后一个 : 视为 tag 分隔符）
+            if [[ "$SRC_IMG" == *":"* ]]; then
+              REPO_PART="${SRC_IMG%:*}"
+              TAG_PART="${SRC_IMG##*:}"
+            else
+              REPO_PART="$SRC_IMG"
+              TAG_PART="latest"
+            fi
+
+            # 仅取最后一段作为仓库名：例如 semitechnologies/weaviate -> weaviate
+            REPO_NAME="${REPO_PART##*/}"
+
+            DEST_IMG="${ACR_REGISTRY}/${NAMESPACE}/${REPO_NAME}:${TAG_PART}"
+
+            echo
+            echo "Source:      $SRC_IMG"
+            echo "Destination: $DEST_IMG"
+
+            docker tag "$SRC_IMG" "$DEST_IMG"
+            docker push "$DEST_IMG"
+
+          done < images.list
+
+      - name: Optionally create GitHub Release
+        # 条件：
+        # 1) push tag 时自动创建
+        # 2) 或手动触发且 create_release == true 时创建
+        if: github.event_name == 'push' && github.ref_type == 'tag' || github.event_name == 'workflow_dispatch' && github.event.inputs.create_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.TAR_NAME }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
