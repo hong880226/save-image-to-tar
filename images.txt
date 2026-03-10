@@ -1,5 +1,2 @@
 # 每行一个镜像，支持注释和空行
-langgenius/dify-sandbox:latest
-langgenius/dify-plugin-daemon:main-local-linux-amd64
-langgenius/dify-api:latest
-langgenius/dify-web:latest
+openclaw/offical:latest
