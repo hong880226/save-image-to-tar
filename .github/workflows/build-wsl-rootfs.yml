@@ -1,15 +1,15 @@
-name: build-wsl-rootfs-from-source
+name: build-wsl-rootfs
 
 on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Git ref (tag/branch/commit), e.g. v2026.3.8"
+        description: "Git ref of openclaw/openclaw to build (tag/branch/commit), e.g. v2026.3.8"
         required: false
         default: "main"
   push:
     tags:
-      - "wsl-src-*"
+      - "wsl-rootfs-*"
 
 permissions:
   contents: write
@@ -17,44 +17,52 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04
+
     steps:
+      - name: Checkout this repo (contains scripts/build-wsl-rootfs.sh)
+        uses: actions/checkout@v4
+
       - name: Checkout OpenClaw source
         uses: actions/checkout@v4
         with:
           repository: openclaw/openclaw
           ref: ${{ inputs.ref }}
-          path: openclaw
+          path: openclaw-src
 
-      - name: Setup Node (build-time)
+      - name: Setup Node.js (>=22)
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
-          cache: "npm"
-          cache-dependency-path: openclaw/package-lock.json
+          node-version: "22"
 
-      - name: Build OpenClaw
-        working-directory: openclaw
+      - name: Enable pnpm via Corepack
         run: |
-          npm ci
-          npm run build
-          # 如果项目有产物目录（例如 dist/ 或 build/），这里可加校验
-          ls -la
+          corepack enable
+          pnpm -v
+          node -v
+          npm -v
 
-      - name: Build WSL rootfs
+      - name: Build OpenClaw (pnpm install / ui:build / build)
+        working-directory: openclaw-src
         run: |
-          sudo apt-get update
-          sudo apt-get install -y debootstrap zstd tar jq curl rsync
-          chmod +x openclaw/scripts/build-rootfs-from-dist.sh
-          sudo bash openclaw/scripts/build-rootfs-from-dist.sh
+          pnpm install --frozen-lockfile
+          pnpm ui:build
+          pnpm build
+
+      - name: Build WSL rootfs (Debian 12) and pack tar.zst
+        env:
+          REPO_DIR: ${{ github.workspace }}/openclaw-src
+        run: |
+          chmod +x scripts/build-wsl-rootfs.sh
+          sudo -E bash scripts/build-wsl-rootfs.sh
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: openclaw-wsl-rootfs
-          path: openclaw/dist/*.tar.zst
+          path: openclaw-src/dist/*.tar.zst
 
-      - name: Create GitHub Release (only on tag)
+      - name: Create GitHub Release (only on tag push)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: openclaw/dist/*.tar.zst
+          files: openclaw-src/dist/*.tar.zst
