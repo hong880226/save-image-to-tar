@@ -1,0 +1,47 @@
+name: build-wsl-rootfs
+
+on:
+  workflow_dispatch:
+    inputs:
+      openclaw_version:
+        description: "OpenClaw version tag, e.g. v1.2.3 (leave empty for latest)"
+        required: false
+        default: ""
+  push:
+    tags:
+      - "wsl-*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd jq curl tar
+
+      - name: Build rootfs
+        env:
+          OPENCLAW_VERSION: ${{ inputs.openclaw_version }}
+        run: |
+          chmod +x scripts/build-rootfs.sh
+          sudo -E bash scripts/build-rootfs.sh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openclaw-wsl-rootfs
+          path: dist/*.tar.zst
+
+      - name: Create GitHub Release (only on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.zst
