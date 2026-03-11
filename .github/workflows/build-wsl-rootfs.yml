@@ -1,15 +1,15 @@
-name: build-wsl-rootfs
+name: build-wsl-rootfs-from-source
 
 on:
   workflow_dispatch:
     inputs:
-      openclaw_version:
-        description: "OpenClaw version tag, e.g. v1.2.3 (leave empty for latest)"
+      ref:
+        description: "Git ref (tag/branch/commit), e.g. v2026.3.8"
         required: false
-        default: ""
+        default: "main"
   push:
     tags:
-      - "wsl-*"
+      - "wsl-src-*"
 
 permissions:
   contents: write
@@ -17,31 +17,44 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04
-
     steps:
-      - name: Checkout
+      - name: Checkout OpenClaw source
         uses: actions/checkout@v4
+        with:
+          repository: openclaw/openclaw
+          ref: ${{ inputs.ref }}
+          path: openclaw
 
-      - name: Install tools
+      - name: Setup Node (build-time)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: openclaw/package-lock.json
+
+      - name: Build OpenClaw
+        working-directory: openclaw
+        run: |
+          npm ci
+          npm run build
+          # 如果项目有产物目录（例如 dist/ 或 build/），这里可加校验
+          ls -la
+
+      - name: Build WSL rootfs
         run: |
           sudo apt-get update
-          sudo apt-get install -y zstd jq curl tar
-
-      - name: Build rootfs
-        env:
-          OPENCLAW_VERSION: ${{ inputs.openclaw_version }}
-        run: |
-          chmod +x scripts/build-rootfs.sh
-          sudo -E bash scripts/build-rootfs.sh
+          sudo apt-get install -y debootstrap zstd tar jq curl rsync
+          chmod +x openclaw/scripts/build-rootfs-from-dist.sh
+          sudo bash openclaw/scripts/build-rootfs-from-dist.sh
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: openclaw-wsl-rootfs
-          path: dist/*.tar.zst
+          path: openclaw/dist/*.tar.zst
 
       - name: Create GitHub Release (only on tag)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.tar.zst
+          files: openclaw/dist/*.tar.zst
