@@ -22,7 +22,8 @@ set -e
 apt-get update
 apt-get install -y --no-install-recommends \
   ca-certificates curl gnupg tzdata bash tini dumb-init \
-  iproute2 procps openssl
+  iproute2 procps openssl \
+  git openssh-client
 
 ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
 echo "Asia/Shanghai" > /etc/timezone
