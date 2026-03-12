@@ -1,26 +1,48 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_DIR="${REPO_DIR:-$(pwd)}"     # 期望当前在 openclaw 仓库根目录
+# openclaw 源码目录（workflow 里用 env 传 REPO_DIR=.../openclaw-src）
+REPO_DIR="${REPO_DIR:-$(pwd)}"
+
 ROOTFS_DIR="/tmp/openclaw-rootfs"
 OUT_DIR="${REPO_DIR}/dist"
 mkdir -p "$OUT_DIR"
 rm -rf "$ROOTFS_DIR"
 mkdir -p "$ROOTFS_DIR"
 
-# 1) rootfs: Debian 12 min
+echo "[i] REPO_DIR=$REPO_DIR"
+
+# ---------- 0) sanity check ----------
+if [[ ! -f "$REPO_DIR/package.json" ]]; then
+  echo "[!] package.json not found under REPO_DIR"
+  exit 1
+fi
+if [[ ! -f "$REPO_DIR/pnpm-lock.yaml" ]]; then
+  echo "[!] pnpm-lock.yaml not found under REPO_DIR (pnpm workspace expected)"
+  exit 1
+fi
+
+# 关键：确保 scripts/run-node.mjs 存在（你遇到的问题就是它丢了）
+if [[ ! -f "$REPO_DIR/scripts/run-node.mjs" ]]; then
+  echo "[!] scripts/run-node.mjs not found under REPO_DIR"
+  echo "    This file is required by: node scripts/run-node.mjs ..."
+  echo "    Please ensure you are copying the full repo (not partial dist/packages/ui only)."
+  exit 1
+fi
+
+# ---------- 1) minimal Debian rootfs ----------
 sudo apt-get update
-sudo apt-get install -y debootstrap zstd tar rsync
+sudo apt-get install -y debootstrap zstd tar rsync curl gnupg
 
 sudo debootstrap --variant=minbase bookworm "$ROOTFS_DIR" http://deb.debian.org/debian
 
-# 2) 运行时依赖：这里有一个现实问题
-# OpenClaw 若是 Node/TS 运行时服务，最终 WSL rootfs 仍需要 node>=22 才能跑（除非 build 产物是独立二进制）。
-# Debian 12 官方源 node 版本不够，所以用 NodeSource 22。
+# ---------- 2) install runtime deps (Node >=22 + tini) ----------
 sudo chroot "$ROOTFS_DIR" bash -lc '
 set -e
 apt-get update
-apt-get install -y --no-install-recommends ca-certificates curl gnupg tzdata bash tini dumb-init
+apt-get install -y --no-install-recommends \
+  ca-certificates curl gnupg tzdata bash tini dumb-init \
+  iproute2 procps
 
 ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
 echo "Asia/Shanghai" > /etc/timezone
@@ -35,49 +57,44 @@ echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.co
 apt-get update
 apt-get install -y --no-install-recommends nodejs
 node -v
+
+# pnpm via corepack, and pin a version (避免每次启动都去下载)
+corepack enable
+corepack prepare pnpm@10.32.1 --activate
+pnpm -v
 '
 
-# 3) 拷贝构建产物（这里需要你确认：pnpm build/ui:build 产物到底输出到哪）
-# 先做“尽量保守”的策略：把常见产物目录复制进去
+# ---------- 3) copy openclaw repo (built) into /opt/openclaw ----------
+# 这里是关键修复：整体同步（保留 scripts/），但排除 .git 等无用内容
 sudo mkdir -p "$ROOTFS_DIR/opt/openclaw"
 
-copy_if_exists () {
-  local src="$1"
-  local dst="$2"
-  if [[ -e "$src" ]]; then
-    sudo mkdir -p "$(dirname "$dst")"
-    sudo rsync -a --delete "$src" "$dst"
-  fi
-}
+sudo rsync -a --delete \
+  --exclude ".git/" \
+  --exclude ".github/" \
+  --exclude ".turbo/" \
+  --exclude ".cache/" \
+  --exclude ".pnpm-store/" \
+  --exclude "node_modules/.cache/" \
+  --exclude "**/*.log" \
+  "$REPO_DIR/" \
+  "$ROOTFS_DIR/opt/openclaw/"
 
-# 你跑完 pnpm build 后，把下面这些目录按实际产物精简（否则可能偏大）
-copy_if_exists "${REPO_DIR}/dist/"        "$ROOTFS_DIR/opt/openclaw/dist/"
-copy_if_exists "${REPO_DIR}/packages/"    "$ROOTFS_DIR/opt/openclaw/packages/"
-copy_if_exists "${REPO_DIR}/ui/"          "$ROOTFS_DIR/opt/openclaw/ui/"
-copy_if_exists "${REPO_DIR}/package.json" "$ROOTFS_DIR/opt/openclaw/package.json"
-copy_if_exists "${REPO_DIR}/pnpm-lock.yaml" "$ROOTFS_DIR/opt/openclaw/pnpm-lock.yaml"
-
-# 4) 运行方式选择：为了“稳”，在 rootfs 内执行一次 pnpm 的生产安装（只装运行所需）
-# 这会比“复制完整 node_modules”更合理，但仍会让 rootfs 变大。
-# 如果 OpenClaw 的发布形态支持“纯 dist 无依赖运行”，我们可以删掉这步。
-sudo chroot "$ROOTFS_DIR" bash -lc '
-set -e
-apt-get update
-apt-get install -y --no-install-recommends git
-corepack enable
-'
-
-# 把工作目录切到 /opt/openclaw 后安装依赖（如果 monorepo，需要按它的方式安装）
-# 注意：这一步是否必须，取决于 openclaw build 产物能否脱离 node_modules 运行
+# ---------- 4) (optional but recommended) ensure deps are present in rootfs ----------
+# 你现在的 rootfs 里已经出现 node_modules，说明你把它带进去了。
+# 为了“可运行”，我们这里采取保守策略：在 rootfs 内再执行一次 pnpm install（有 lockfile）
+# 如果你想减小体积，后续可改成只带 production 依赖或做 pnpm deploy。
 sudo chroot "$ROOTFS_DIR" bash -lc '
 set -e
 cd /opt/openclaw
-# 这里假设根目录能安装；如果官方要求在仓库根 pnpm install 才能跑，就保留
-pnpm install --prod --frozen-lockfile || true
+corepack enable
+corepack prepare pnpm@10.32.1 --activate
+pnpm install --frozen-lockfile
 '
 
-# 5) 配置/日志 + 启动脚本
+# ---------- 5) create data dirs + start script ----------
 sudo mkdir -p "$ROOTFS_DIR/var/lib/openclaw/config" "$ROOTFS_DIR/var/log/openclaw"
+sudo mkdir -p "$ROOTFS_DIR/usr/local/bin"
+
 sudo tee "$ROOTFS_DIR/usr/local/bin/start-openclaw.sh" >/dev/null <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -95,23 +112,16 @@ ln -s "$OPENCLAW_HOME/config" /root/.openclaw
 
 cd /opt/openclaw
 
-# 这里按你实际产物/启动方式改：
-# 如果最终是 CLI：openclaw gateway start ...
-# 如果是 pnpm 脚本：pnpm gateway:start ...
-# 先给一个保守写法：优先找 openclaw 命令
-if command -v openclaw >/dev/null 2>&1; then
-  nohup openclaw gateway start --port "$GATEWAY_PORT" >>"$OPENCLAW_LOG_DIR/gateway.log" 2>&1 &
-else
-  corepack enable >/dev/null 2>&1 || true
-  nohup pnpm gateway:start -- --port "$GATEWAY_PORT" >>"$OPENCLAW_LOG_DIR/gateway.log" 2>&1 &
-fi
+# 先用你已验证存在的命令：gateway:dev
+# 若后续确认有 prod/start，再换成 gateway:start/serve 等
+nohup pnpm gateway:dev -- --port "$GATEWAY_PORT" >>"$OPENCLAW_LOG_DIR/gateway.log" 2>&1 &
 
 echo "OpenClaw gateway: http://localhost:${GATEWAY_PORT}"
 echo "Log: ${OPENCLAW_LOG_DIR}/gateway.log"
 EOF
 sudo chmod +x "$ROOTFS_DIR/usr/local/bin/start-openclaw.sh"
 
-# 6) 清理瘦身
+# ---------- 6) cleanup (keep moderate size, but don't break runtime) ----------
 sudo chroot "$ROOTFS_DIR" bash -lc '
 set -e
 pnpm store prune || true
@@ -121,8 +131,8 @@ rm -rf /var/lib/apt/lists/*
 rm -rf /usr/share/doc/* /usr/share/man/* /usr/share/info/* || true
 '
 
-# 7) 打包
-OUT="${OUT_DIR}/openclaw-debian12-wsl-rootfs-node22.tar"
+# ---------- 7) pack ----------
+OUT="$OUT_DIR/openclaw-debian12-wsl-rootfs-node22.tar"
 sudo tar -C "$ROOTFS_DIR" -cf "$OUT" .
 zstd -19 -T0 --rm "$OUT"
-echo "Done: ${OUT}.zst"
+echo "[OK] $OUT.zst"
