@@ -12,6 +12,10 @@ GATEWAY_PORT="${GATEWAY_PORT:-18789}"
 # build-hard = 强制在 CI/chroot 内构建成功（失败则退出）
 LLAMA_MODE="${LLAMA_MODE:-off}"
 
+# none | chromium
+# chromium = 安装 chromium，并提供 headless wrapper 给 openclaw 使用（默认）
+BROWSER_MODE="${BROWSER_MODE:-chromium}"
+
 mkdir -p "$OUT_DIR"
 rm -rf "$ROOTFS_DIR"
 mkdir -p "$ROOTFS_DIR"
@@ -19,6 +23,7 @@ mkdir -p "$ROOTFS_DIR"
 echo "[i] OPENCLAW_VERSION=$OPENCLAW_VERSION"
 echo "[i] GATEWAY_PORT=$GATEWAY_PORT"
 echo "[i] LLAMA_MODE=$LLAMA_MODE"
+echo "[i] BROWSER_MODE=$BROWSER_MODE"
 
 sudo apt-get update
 sudo apt-get install -y debootstrap zstd tar curl gnupg ca-certificates
@@ -49,7 +54,23 @@ node -v
 npm -v
 '
 
-# 2) optional build toolchain for llama.cpp
+# 2) browser: chromium (headless, for openclaw only)
+if [[ "$BROWSER_MODE" == "chromium" ]]; then
+  sudo chroot "$ROOTFS_DIR" bash -lc '
+set -e
+apt-get update
+apt-get install -y --no-install-recommends \
+  chromium \
+  # 常见 headless 依赖/字体（减少渲染/启动问题）
+  fonts-noto-cjk fonts-noto-color-emoji \
+  libasound2 libgbm1 libgtk-3-0 libnss3 libxss1 libxshmfence1 \
+  xdg-utils
+
+chromium --version || true
+'
+fi
+
+# 3) optional build toolchain for llama.cpp
 if [[ "$LLAMA_MODE" == "build-soft" || "$LLAMA_MODE" == "build-hard" ]]; then
   sudo chroot "$ROOTFS_DIR" bash -lc '
 set -e
@@ -59,8 +80,7 @@ apt-get install -y --no-install-recommends \
 '
 fi
 
-# 3) install openclaw globally
-# 关键：为保证“可靠打包”，这里永远用 --ignore-scripts，避免 node-llama-cpp postinstall 在 chroot 崩溃
+# 4) install openclaw globally (always ignore scripts to keep CI reliable)
 sudo chroot "$ROOTFS_DIR" bash -lc "
 set -e
 export CI=true
@@ -71,17 +91,15 @@ command -v openclaw
 openclaw --help >/dev/null || true
 "
 
-# 4) if build-soft/build-hard: try to enable llama.cpp (best-effort or strict)
+# 5) if build-soft/build-hard: try to enable llama.cpp (best-effort or strict)
 if [[ "$LLAMA_MODE" == "build-soft" || "$LLAMA_MODE" == "build-hard" ]]; then
   if [[ "$LLAMA_MODE" == "build-hard" ]]; then
-    # strict: fail job if llama cannot be enabled inside chroot
     sudo chroot "$ROOTFS_DIR" bash -lc "
 set -e
 export CI=true
 npm rebuild -g node-llama-cpp
 "
   else
-    # soft: do not fail job
     set +e
     sudo chroot "$ROOTFS_DIR" bash -lc "
 set -e
@@ -97,9 +115,38 @@ npm rebuild -g node-llama-cpp
   fi
 fi
 
-# 5) persistent dirs + start scripts
+# 6) persistent dirs + helper scripts
 sudo mkdir -p "$ROOTFS_DIR/var/lib/openclaw" "$ROOTFS_DIR/var/log/openclaw" "$ROOTFS_DIR/usr/local/bin"
 
+# 6.1 headless chromium wrapper (stable path)
+if [[ "$BROWSER_MODE" == "chromium" ]]; then
+  sudo tee "$ROOTFS_DIR/usr/local/bin/openclaw-chromium" >/dev/null <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# OpenClaw headless browser wrapper
+# Notes:
+# - --no-sandbox: 在部分 WSL/容器环境是必须的；如果你确认 sandbox 正常，可删除
+# - --headless=new: Chromium 新 headless
+# - --disable-dev-shm-usage: 避免 /dev/shm 太小导致崩溃
+exec /usr/bin/chromium \
+  --headless=new \
+  --disable-gpu \
+  --no-sandbox \
+  --disable-dev-shm-usage \
+  --remote-debugging-port=0 \
+  "$@"
+EOF
+  sudo chmod +x "$ROOTFS_DIR/usr/local/bin/openclaw-chromium"
+
+  # 给 OpenClaw 提供一个约定的 env（你也可以在 openclaw.json 里指向该路径）
+  sudo mkdir -p "$ROOTFS_DIR/etc/profile.d"
+  sudo tee "$ROOTFS_DIR/etc/profile.d/openclaw-browser.sh" >/dev/null <<'EOF'
+export OPENCLAW_BROWSER_BIN=${OPENCLAW_BROWSER_BIN:-/usr/local/bin/openclaw-chromium}
+EOF
+fi
+
+# 6.2 start/openboard
 sudo tee "$ROOTFS_DIR/usr/local/bin/start-openclaw.sh" >/dev/null <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -115,11 +162,22 @@ export HOME=/root
 rm -rf /root/.openclaw || true
 ln -s "\$OPENCLAW_HOME" /root/.openclaw
 
-nohup openclaw gateway --port "\$GATEWAY_PORT" --verbose \\
-  >>"\$OPENCLAW_LOG_DIR/gateway.log" 2>&1 &
+# 确保 openclaw 能看到浏览器 wrapper（profile.d 只对交互 shell 生效，这里显式导出）
+EOF
 
-echo "OpenClaw gateway: http://localhost:\$GATEWAY_PORT"
-echo "Log: \$OPENCLAW_LOG_DIR/gateway.log"
+if [[ "$BROWSER_MODE" == "chromium" ]]; then
+  sudo tee -a "$ROOTFS_DIR/usr/local/bin/start-openclaw.sh" >/dev/null <<'EOF'
+export OPENCLAW_BROWSER_BIN=${OPENCLAW_BROWSER_BIN:-/usr/local/bin/openclaw-chromium}
+EOF
+fi
+
+sudo tee -a "$ROOTFS_DIR/usr/local/bin/start-openclaw.sh" >/dev/null <<'EOF'
+
+nohup openclaw gateway --port "$GATEWAY_PORT" --verbose \
+  >>"$OPENCLAW_LOG_DIR/gateway.log" 2>&1 &
+
+echo "OpenClaw gateway: http://localhost:${GATEWAY_PORT}"
+echo "Log: ${OPENCLAW_LOG_DIR}/gateway.log"
 EOF
 sudo chmod +x "$ROOTFS_DIR/usr/local/bin/start-openclaw.sh"
 
@@ -140,19 +198,15 @@ if [[ "$LLAMA_MODE" == "build-soft" || "$LLAMA_MODE" == "build-hard" ]]; then
 #!/usr/bin/env bash
 set -euo pipefail
 export CI=true
-
 apt-get update
 apt-get install -y --no-install-recommends build-essential make cmake python3 pkg-config
-
-# 重新构建 node-llama-cpp（在真实 WSL 环境里比 chroot/CI 更容易通过其自检）
 npm rebuild -g node-llama-cpp
-
 echo "[OK] llama.cpp backend enabled."
 EOF
   sudo chmod +x "$ROOTFS_DIR/usr/local/bin/openclaw-enable-llama.sh"
 fi
 
-# 6) cleanup
+# 7) cleanup
 sudo chroot "$ROOTFS_DIR" bash -lc '
 set -e
 npm cache clean --force || true
@@ -161,8 +215,8 @@ rm -rf /var/lib/apt/lists/*
 rm -rf /usr/share/doc/* /usr/share/man/* /usr/share/info/* || true
 '
 
-# 7) pack
-OUT="$OUT_DIR/openclaw-debian12-wsl-rootfs-node22-openclaw-${OPENCLAW_VERSION}-llama-${LLAMA_MODE}.tar"
+# 8) pack
+OUT="$OUT_DIR/openclaw-debian12-wsl-rootfs-node22-openclaw-${OPENCLAW_VERSION}-llama-${LLAMA_MODE}-browser-${BROWSER_MODE}.tar"
 sudo tar -C "$ROOTFS_DIR" -cf "$OUT" .
 zstd -19 -T0 --rm "$OUT"
 echo "[OK] $OUT.zst"
