@@ -59,9 +59,9 @@ if [[ "$BROWSER_MODE" == "chromium" ]]; then
   sudo chroot "$ROOTFS_DIR" bash -lc '
 set -e
 apt-get update
+# 常见 headless 依赖/字体（减少渲染/启动问题）
 apt-get install -y --no-install-recommends \
   chromium \
-  # 常见 headless 依赖/字体（减少渲染/启动问题）
   fonts-noto-cjk fonts-noto-color-emoji \
   libasound2 libgbm1 libgtk-3-0 libnss3 libxss1 libxshmfence1 \
   xdg-utils
