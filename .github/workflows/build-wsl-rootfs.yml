@@ -3,13 +3,14 @@ name: build-wsl-rootfs
 on:
   workflow_dispatch:
     inputs:
-      ref:
-        description: "Git ref of openclaw/openclaw to build (tag/branch/commit), e.g. v2026.3.8"
+      openclaw_version:
+        description: "npm version/tag for openclaw (e.g. 2026.3.9 / latest / beta / dev)"
         required: false
-        default: "main"
-  push:
-    tags:
-      - "wsl-rootfs-*"
+        default: "latest"
+      gateway_port:
+        description: "Default gateway port baked into start-openclaw.sh"
+        required: false
+        default: "18789"
 
 permissions:
   contents: write
@@ -22,35 +23,11 @@ jobs:
       - name: Checkout this repo (contains scripts/build-wsl-rootfs.sh)
         uses: actions/checkout@v4
 
-      - name: Checkout OpenClaw source
-        uses: actions/checkout@v4
-        with:
-          repository: openclaw/openclaw
-          ref: ${{ inputs.ref }}
-          path: openclaw-src
-
-      - name: Setup Node.js (>=22)
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-
-      - name: Enable pnpm via Corepack
-        run: |
-          corepack enable
-          pnpm -v
-          node -v
-          npm -v
-
-      - name: Build OpenClaw (pnpm install / ui:build / build)
-        working-directory: openclaw-src
-        run: |
-          pnpm install --frozen-lockfile
-          pnpm ui:build
-          pnpm build
-
-      - name: Build WSL rootfs (Debian 12) and pack tar.zst
+      - name: Build WSL rootfs (Debian 12 + Node 22 + openclaw from npm)
         env:
-          REPO_DIR: ${{ github.workspace }}/openclaw-src
+          OUT_DIR: ${{ github.workspace }}/dist
+          OPENCLAW_VERSION: ${{ inputs.openclaw_version }}
+          GATEWAY_PORT: ${{ inputs.gateway_port }}
         run: |
           chmod +x scripts/build-wsl-rootfs.sh
           sudo -E bash scripts/build-wsl-rootfs.sh
@@ -59,10 +36,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: openclaw-wsl-rootfs
-          path: openclaw-src/dist/*.tar.zst
+          path: dist/*.tar.zst
+          if-no-files-found: error
 
-      - name: Create GitHub Release (only on tag push)
+      - name: Create GitHub Release (optional)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: openclaw-src/dist/*.tar.zst
+          files: dist/*.tar.zst
