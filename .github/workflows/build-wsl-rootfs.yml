@@ -12,13 +12,14 @@ on:
         required: false
         default: "18789"
       llama_mode:
-        description: "Local llama.cpp mode: off (skip postinstall) / build (compile from source)"
+        description: "llama.cpp mode: off (default stable) / build-soft / build-hard"
         required: false
         default: "off"
         type: choice
         options:
           - off
-          - build
+          - build-soft
+          - build-hard
 
 permissions:
   contents: write
