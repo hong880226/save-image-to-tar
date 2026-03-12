@@ -20,6 +20,14 @@ on:
           - off
           - build-soft
           - build-hard
+      browser_mode:
+        description: "browser mode: chromium (default headless) / none"
+        required: false
+        default: "chromium"
+        type: choice
+        options:
+          - chromium
+          - none
 
 permissions:
   contents: write
@@ -38,6 +46,7 @@ jobs:
           OPENCLAW_VERSION: ${{ inputs.openclaw_version }}
           GATEWAY_PORT: ${{ inputs.gateway_port }}
           LLAMA_MODE: ${{ inputs.llama_mode }}
+          BROWSER_MODE: ${{ inputs.browser_mode }}
         run: |
           chmod +x scripts/build-wsl-rootfs.sh
           sudo -E bash scripts/build-wsl-rootfs.sh
