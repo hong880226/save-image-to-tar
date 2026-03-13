@@ -11,12 +11,29 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      TARGET_REPO: hong880226/videcode-fake
+      TARGET_REF: ${{ inputs.ref }}
+      REPO_READ_TOKEN: ${{ secrets.REPO_READ_TOKEN }}
+
     steps:
-      - name: Checkout cursor-fake
+      # 1) 如果配置了私有仓库读取 token，则走带 token 的 checkout
+      - name: Checkout target repo with token
+        if: ${{ env.REPO_READ_TOKEN != '' }}
         uses: actions/checkout@v4
         with:
-          repository: hong880226/videcode-fake
-          ref: ${{ inputs.ref }}
+          repository: ${{ env.TARGET_REPO }}
+          ref: ${{ env.TARGET_REF }}
+          path: cursor-fake
+          token: ${{ env.REPO_READ_TOKEN }}
+
+      # 2) 如果没有 token，则按 public 仓库方式 checkout
+      - name: Checkout target repo without token
+        if: ${{ env.REPO_READ_TOKEN == '' }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TARGET_REPO }}
+          ref: ${{ env.TARGET_REF }}
           path: cursor-fake
 
       - name: Setup Go
@@ -24,8 +41,16 @@ jobs:
         with:
           go-version: "1.22"
 
+      - name: Show Go env
+        working-directory: cursor-fake
+        shell: cmd
+        run: |
+          go version
+          go env
+
       - name: Build portable exe
         working-directory: cursor-fake
+        shell: cmd
         run: |
           go mod download
           set GOOS=windows
@@ -35,8 +60,9 @@ jobs:
 
       - name: Pack zip
         working-directory: cursor-fake
+        shell: powershell
         run: |
-          powershell -Command "Compress-Archive -Path cursor-fake.exe -DestinationPath cursor-fake-windows-amd64.zip -Force"
+          Compress-Archive -Path cursor-fake.exe -DestinationPath cursor-fake-windows-amd64.zip -Force
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
