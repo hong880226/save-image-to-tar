@@ -15,7 +15,7 @@ jobs:
       - name: Checkout cursor-fake
         uses: actions/checkout@v4
         with:
-          repository: tiechui1994/cursor-fake
+          repository: hong880226/videcode-fake
           ref: ${{ inputs.ref }}
           path: cursor-fake
 
