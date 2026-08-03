@@ -1,2 +1,2 @@
 # 每行一个镜像，支持注释和空行
-alpine/openclaw:latest
+lscr.io/linuxserver/code-server:latest
