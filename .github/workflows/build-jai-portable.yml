@@ -1,0 +1,162 @@
+name: Build JAI Portable
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "上游分支、标签或提交 SHA，例如 main 或 v0.4.4"
+        required: true
+        default: "main"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows x64 Portable
+    runs-on: windows-latest
+
+    steps:
+      # 直接下载上游源码，不需要 Fork。
+      # 源码放在 source 目录，避免与当前仓库混淆。
+      - name: Checkout upstream source
+        uses: actions/checkout@v4
+        with:
+          repository: JNNarrator/jai-gateway
+          ref: ${{ inputs.source_ref }}
+          path: source
+          persist-credentials: false
+
+      - name: Record source revision
+        shell: pwsh
+        run: |
+          $sha = git -C source rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) {
+            throw "无法读取源码提交 SHA"
+          }
+          "SOURCE_SHA=$sha" >> $env:GITHUB_ENV
+          Write-Host "Building upstream commit: $sha"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: source/ui/pnpm-lock.yaml
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            source -> target
+
+      - name: Install frontend dependencies
+        run: pnpm --dir source/ui install --frozen-lockfile
+
+      # 只修改 runner 上的源码副本，不修改上游。
+      # 便携版不需要 updater 安装包及其签名产物。
+      - name: Adjust portable build configuration
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $configPath = "source/src-tauri/tauri.conf.json"
+          $config = Get-Content $configPath -Raw | ConvertFrom-Json
+
+          $config.bundle.active = $false
+          $config.bundle.createUpdaterArtifacts = $false
+
+          $json = $config | ConvertTo-Json -Depth 100
+          $encoding = [System.Text.UTF8Encoding]::new($false)
+          $fullPath = Join-Path $env:GITHUB_WORKSPACE $configPath
+          [System.IO.File]::WriteAllText($fullPath, $json, $encoding)
+
+      - name: Build portable application
+        uses: tauri-apps/tauri-action@v0
+        with:
+          projectPath: source
+          args: --ci --no-bundle
+
+      - name: Package portable ZIP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $releaseDir = Join-Path $env:GITHUB_WORKSPACE "source/target/release"
+          $packageDir = Join-Path $env:GITHUB_WORKSPACE "package/JAI-portable"
+          $artifactDir = Join-Path $env:GITHUB_WORKSPACE "artifacts"
+
+          if (!(Test-Path $releaseDir)) {
+            throw "未找到 $releaseDir，请检查 Cargo 输出目录配置。"
+          }
+
+          $executables = @(
+            Get-ChildItem $releaseDir -Filter "*.exe" -File
+          )
+
+          if ($executables.Count -eq 0) {
+            throw "未找到应用 EXE，请检查构建日志。"
+          }
+
+          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+          New-Item -ItemType Directory -Force -Path $artifactDir | Out-Null
+
+          foreach ($file in $executables) {
+            Copy-Item $file.FullName -Destination $packageDir
+          }
+
+          Get-ChildItem $releaseDir -Filter "*.dll" -File |
+            ForEach-Object {
+              Copy-Item $_.FullName -Destination $packageDir
+            }
+
+          # 保留上游仓库根目录中的许可证文件。
+          Get-ChildItem "source" -File |
+            Where-Object { $_.Name -match "^(LICENSE|COPYING)" } |
+            ForEach-Object {
+              Copy-Item $_.FullName -Destination $packageDir
+            }
+
+          @"
+          JAI Gateway Windows x64 免安装构建
+
+          上游仓库：https://github.com/JNNarrator/jai-gateway
+          源码提交：$env:SOURCE_SHA
+
+          使用方法：
+          将 ZIP 完整解压，然后运行应用 EXE。
+
+          注意：
+          1. 需要系统具备 Microsoft WebView2 Runtime。
+          2. 本构建未改变应用原有的配置、数据库和凭据存储方式。
+          3. 应用可能仍使用上游的自动更新通道。
+          4. 此包是自行构建的免安装版本，并非上游官方发布包。
+          "@ | Set-Content `
+            -Path (Join-Path $packageDir "PORTABLE-README.txt") `
+            -Encoding utf8
+
+          $zipPath = Join-Path $artifactDir "JAI-windows-x64-portable.zip"
+
+          Compress-Archive `
+            -Path $packageDir `
+            -DestinationPath $zipPath `
+            -Force
+
+          Get-ChildItem $packageDir | Format-Table Name, Length
+          Write-Host "Generated: $zipPath"
+
+      - name: Upload portable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: JAI-windows-x64-portable
+          path: artifacts/JAI-windows-x64-portable.zip
+          if-no-files-found: error
+          retention-days: 14
