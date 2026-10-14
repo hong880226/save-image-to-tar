@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       source_ref:
-        description: "上游分支、标签或提交 SHA，例如 main 或 v0.4.4"
+        description: "上游分支、标签或提交 SHA"
         required: true
         default: "main"
         type: string
@@ -18,8 +18,6 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      # 直接下载上游源码，不需要 Fork。
-      # 源码放在 source 目录，避免与当前仓库混淆。
       - name: Checkout upstream source
         uses: actions/checkout@v4
         with:
@@ -31,12 +29,15 @@ jobs:
       - name: Record source revision
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           $sha = git -C source rev-parse HEAD
           if ($LASTEXITCODE -ne 0) {
             throw "无法读取源码提交 SHA"
           }
+
           "SOURCE_SHA=$sha" >> $env:GITHUB_ENV
-          Write-Host "Building upstream commit: $sha"
+          Write-Host "Source commit: $sha"
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -62,96 +63,199 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm --dir source/ui install --frozen-lockfile
 
-      # 只修改 runner 上的源码副本，不修改上游。
-      # 便携版不需要 updater 安装包及其签名产物。
-      - name: Adjust portable build configuration
+      - name: Configure portable build
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $configPath = "source/src-tauri/tauri.conf.json"
+
+          $configPath = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "source/src-tauri/tauri.conf.json"
+
           $config = Get-Content $configPath -Raw | ConvertFrom-Json
 
+          # 禁止安装包及 updater 签名产物。
+          # 注意：这不会禁用源码中的自动更新调用。
           $config.bundle.active = $false
           $config.bundle.createUpdaterArtifacts = $false
 
           $json = $config | ConvertTo-Json -Depth 100
-          $encoding = [System.Text.UTF8Encoding]::new($false)
-          $fullPath = Join-Path $env:GITHUB_WORKSPACE $configPath
-          [System.IO.File]::WriteAllText($fullPath, $json, $encoding)
+          $utf8 = [System.Text.UTF8Encoding]::new($false)
 
-      - name: Build portable application
+          [System.IO.File]::WriteAllText($configPath, $json, $utf8)
+
+      - name: Build application
         uses: tauri-apps/tauri-action@v0
         with:
           projectPath: source
           args: --ci --no-bundle
 
-      - name: Package portable ZIP
+      - name: Inspect frontend output
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          $releaseDir = Join-Path $env:GITHUB_WORKSPACE "source/target/release"
-          $packageDir = Join-Path $env:GITHUB_WORKSPACE "package/JAI-portable"
-          $artifactDir = Join-Path $env:GITHUB_WORKSPACE "artifacts"
+          $dist = Join-Path $env:GITHUB_WORKSPACE "source/ui/dist"
+          $diag = Join-Path $env:GITHUB_WORKSPACE "diagnostics"
+
+          New-Item -ItemType Directory -Force -Path $diag | Out-Null
+
+          if (!(Test-Path "$dist/index.html")) {
+            throw "未找到前端 dist/index.html"
+          }
+
+          "Source commit: $env:SOURCE_SHA" |
+            Set-Content "$diag/source.txt" -Encoding utf8
+
+          Write-Host "=== Frontend package.json ==="
+          Get-Content "source/ui/package.json"
+
+          Write-Host "=== Generated index.html ==="
+          Get-Content "$dist/index.html"
+
+          Write-Host "=== Frontend file list ==="
+          Get-ChildItem $dist -Recurse -File |
+            Select-Object FullName, Length |
+            Format-Table -AutoSize |
+            Out-String -Width 240 |
+            Tee-Object -FilePath "$diag/frontend-files.txt" |
+            Write-Host
+
+          $cssFiles = @(
+            Get-ChildItem $dist -Recurse -Filter "*.css" -File
+          )
+
+          if ($cssFiles.Count -eq 0) {
+            Write-Warning "未发现独立 CSS 文件，请检查是否通过 JS 注入样式。"
+          }
+
+          $report = @()
+
+          foreach ($file in $cssFiles) {
+            $css = Get-Content $file.FullName -Raw
+
+            $report += "CSS: $($file.Name)"
+            $report += "Bytes: $($file.Length)"
+            $report += "@layer: $($css.Contains('@layer'))"
+            $report += "@property: $($css.Contains('@property'))"
+            $report += "oklch(): $($css.Contains('oklch('))"
+            $report += ""
+          }
+
+          $report |
+            Set-Content "$diag/css-features.txt" -Encoding utf8
+
+          Get-Content "$diag/css-features.txt"
+
+      - name: Package portable application
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $releaseDir = Join-Path `
+            $env:GITHUB_WORKSPACE "source/target/release"
+
+          $packageDir = Join-Path `
+            $env:GITHUB_WORKSPACE "package/JAI-portable"
+
+          $artifactDir = Join-Path `
+            $env:GITHUB_WORKSPACE "artifacts"
 
           if (!(Test-Path $releaseDir)) {
-            throw "未找到 $releaseDir，请检查 Cargo 输出目录配置。"
+            throw "未找到 target/release，请检查 Cargo 输出目录。"
           }
 
           $executables = @(
             Get-ChildItem $releaseDir -Filter "*.exe" -File
           )
 
-          if ($executables.Count -eq 0) {
-            throw "未找到应用 EXE，请检查构建日志。"
+          if ($executables.Count -ne 1) {
+            $names = $executables.Name -join ", "
+            throw "预期一个应用 EXE，实际找到 $($executables.Count) 个：$names。请明确选择主程序后调整脚本。"
           }
+
+          $exeName = $executables[0].Name
 
           New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
           New-Item -ItemType Directory -Force -Path $artifactDir | Out-Null
 
-          foreach ($file in $executables) {
-            Copy-Item $file.FullName -Destination $packageDir
-          }
+          Copy-Item $executables[0].FullName -Destination $packageDir
 
           Get-ChildItem $releaseDir -Filter "*.dll" -File |
             ForEach-Object {
               Copy-Item $_.FullName -Destination $packageDir
             }
 
-          # 保留上游仓库根目录中的许可证文件。
           Get-ChildItem "source" -File |
             Where-Object { $_.Name -match "^(LICENSE|COPYING)" } |
             ForEach-Object {
               Copy-Item $_.FullName -Destination $packageDir
             }
 
-          @"
-          JAI Gateway Windows x64 免安装构建
+          # 启动脚本：
+          # 如果 WebView2/msedgewebview2.exe 存在，优先使用该固定运行时；
+          # 否则使用系统自动发现的运行时。
+          $launcher = @'
+          @echo off
+          setlocal
+          cd /d "%~dp0"
 
-          上游仓库：https://github.com/JNNarrator/jai-gateway
-          源码提交：$env:SOURCE_SHA
+          set "WEBVIEW2_BROWSER_EXECUTABLE_FOLDER="
+
+          if exist "%~dp0WebView2\msedgewebview2.exe" (
+            set "WEBVIEW2_BROWSER_EXECUTABLE_FOLDER=%~dp0WebView2"
+            echo Using bundled WebView2 runtime.
+          ) else (
+            echo Using system WebView2 runtime.
+          )
+
+          start "" "%~dp0__APP_EXE__%"
+          endlocal
+          '@
+
+          $launcher = $launcher.Replace("__APP_EXE__", $exeName)
+
+          [System.IO.File]::WriteAllText(
+            (Join-Path $packageDir "Start-JAI.cmd"),
+            $launcher,
+            [System.Text.Encoding]::ASCII
+          )
+
+          @"
+          JAI Gateway Windows x64 Portable
+
+          Upstream: https://github.com/JNNarrator/jai-gateway
+          Source commit: $env:SOURCE_SHA
+          Application: $exeName
 
           使用方法：
-          将 ZIP 完整解压，然后运行应用 EXE。
+          1. 完整解压到本地可写目录。
+          2. 双击 Start-JAI.cmd。
+
+          可选的绿色 WebView2：
+          将固定版本 x64 WebView2 完整文件放到 WebView2 子目录。
+          必须存在 WebView2/msedgewebview2.exe。
+          启动脚本会优先使用它。
 
           注意：
-          1. 需要系统具备 Microsoft WebView2 Runtime。
-          2. 本构建未改变应用原有的配置、数据库和凭据存储方式。
-          3. 应用可能仍使用上游的自动更新通道。
-          4. 此包是自行构建的免安装版本，并非上游官方发布包。
+          - 此包未附带 WebView2。
+          - 未改变原应用的数据库、配置和凭据存储路径。
+          - 未禁用源码中的自动更新；请暂勿执行应用内更新。
+          - 这是自行构建版本，不是上游官方发行包。
           "@ | Set-Content `
-            -Path (Join-Path $packageDir "PORTABLE-README.txt") `
+            (Join-Path $packageDir "PORTABLE-README.txt") `
             -Encoding utf8
 
-          $zipPath = Join-Path $artifactDir "JAI-windows-x64-portable.zip"
+          $zipPath = Join-Path `
+            $artifactDir "JAI-windows-x64-portable.zip"
 
           Compress-Archive `
             -Path $packageDir `
             -DestinationPath $zipPath `
             -Force
 
-          Get-ChildItem $packageDir | Format-Table Name, Length
-          Write-Host "Generated: $zipPath"
+          Get-ChildItem $packageDir |
+            Format-Table Name, Length
 
       - name: Upload portable ZIP
         uses: actions/upload-artifact@v4
@@ -159,4 +263,19 @@ jobs:
           name: JAI-windows-x64-portable
           path: artifacts/JAI-windows-x64-portable.zip
           if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload frontend diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: JAI-frontend-diagnostics
+          path: |
+            diagnostics/
+            source/ui/dist/
+            source/ui/package.json
+            source/ui/vite.config.*
+            source/ui/tailwind.config.*
+            source/ui/postcss.config.*
+          if-no-files-found: warn
           retention-days: 14
