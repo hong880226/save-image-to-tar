@@ -1,12 +1,14 @@
 name: probe
-  on:
-    workflow_dispatch:
-  jobs:
-    check:
-      runs-on: ubuntu-latest
-      steps:
-        - name: probe list_models
-          run: |
-            curl -4 -i --connect-timeout 10 --max-time 30 \
-              https://code-arena.fly.dev/list_models || true
-            echo "---- exit: $? ----"
+
+on:
+  workflow_dispatch:
+  
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: probe list_models
+        run: |
+          curl -4 -i --connect-timeout 10 --max-time 30 \
+            https://code-arena.fly.dev/list_models || true
+          echo "---- exit: $? ----"
