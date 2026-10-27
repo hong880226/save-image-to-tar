@@ -10,5 +10,6 @@ jobs:
       - name: probe list_models
         run: |
           curl -4 -i --connect-timeout 10 --max-time 30 \
-            https://code-arena.fly.dev/list_models || true
+            https://code-arena.fly.dev/list_models
           echo "---- exit: $? ----"
+        continue-on-error: true
