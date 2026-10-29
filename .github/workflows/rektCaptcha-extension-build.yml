@@ -1,0 +1,113 @@
+name: Build rektCaptcha-extension
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Clone source repository
+        shell: bash
+        run: |
+          git clone --depth 1 \
+            https://github.com/xauravww/rektCaptcha-extension.git \
+            source
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -f pnpm-lock.yaml ]; then
+            corepack enable
+            pnpm install --frozen-lockfile
+          elif [ -f yarn.lock ]; then
+            corepack enable
+            yarn install --frozen-lockfile
+          elif [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+            npm ci
+          elif [ -f package.json ]; then
+            npm install
+          else
+            echo "没有发现 package.json，跳过依赖安装。"
+          fi
+
+      - name: Build
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -f package.json ] && \
+             node -e "const p=require('./package.json'); process.exit(p.scripts?.build ? 0 : 1)"; then
+            if [ -f pnpm-lock.yaml ]; then
+              pnpm run build
+            elif [ -f yarn.lock ]; then
+              yarn run build
+            else
+              npm run build
+            fi
+          else
+            echo "没有找到 scripts.build，跳过编译，后续直接打包扩展文件。"
+          fi
+
+      - name: Package extension
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # 优先使用常见构建目录；否则搜索 manifest.json 所在目录
+          ext_dir=""
+          for dir in dist build out; do
+            if [ -f "$dir/manifest.json" ]; then
+              ext_dir="$dir"
+              break
+            fi
+          done
+
+          if [ -z "$ext_dir" ]; then
+            manifest="$(find . \
+              -type d \( -name .git -o -name node_modules \) -prune -o \
+              -type f -name manifest.json -print -quit)"
+
+            if [ -z "$manifest" ]; then
+              echo "::error::找不到 manifest.json，无法确定扩展文件目录。"
+              exit 1
+            fi
+
+            ext_dir="$(dirname "$manifest")"
+          fi
+
+          mkdir -p "$GITHUB_WORKSPACE/release"
+          archive="$GITHUB_WORKSPACE/release/rektCaptcha-extension.zip"
+
+          if [ "$ext_dir" = "." ]; then
+            zip -qr "$archive" . \
+              -x '.git/*' '.github/*' 'node_modules/*' '*/node_modules/*'
+          else
+            (
+              cd "$ext_dir"
+              zip -qr "$archive" . \
+                -x '.git/*' '.github/*' 'node_modules/*' '*/node_modules/*'
+            )
+          fi
+
+          echo "打包目录：$ext_dir"
+          echo "输出文件：$archive"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rektCaptcha-extension
+          path: release/rektCaptcha-extension.zip
+          if-no-files-found: error
+          retention-days: 14
